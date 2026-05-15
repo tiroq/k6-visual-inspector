@@ -1,0 +1,50 @@
+version: "3"
+
+vars:
+  VENV: .venv
+  PYTHON: "{{.VENV}}/bin/python"
+  PIP: "{{.VENV}}/bin/pip"
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmd: task --list
+
+  venv:
+    desc: Create the virtual environment
+    cmd: python3 -m venv {{.VENV}}
+    status:
+      - test -d {{.VENV}}
+
+  install:
+    desc: Install Python dependencies into the venv
+    deps: [venv]
+    cmds:
+      - "{{.PIP}} install --upgrade pip"
+      - "{{.PIP}} install -r requirements.txt"
+
+  tesseract:
+    desc: Install Tesseract OCR system dependency (Debian/Ubuntu only)
+    cmd: sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
+
+  setup:
+    desc: Full bootstrap — create venv and install dependencies
+    deps: [install]
+
+  run:
+    desc: "Run cluster_screenshots.py. Required vars: INPUT, OUTPUT. Optional: ARGS"
+    vars:
+      INPUT: '{{.INPUT | default ""}}'
+      OUTPUT: '{{.OUTPUT | default ""}}'
+      ARGS: '{{.ARGS | default ""}}'
+    preconditions:
+      - sh: '[ -n "{{.INPUT}}" ]'
+        msg: "INPUT is required. Example: task run INPUT=./screenshots OUTPUT=./out"
+      - sh: '[ -n "{{.OUTPUT}}" ]'
+        msg: "OUTPUT is required. Example: task run INPUT=./screenshots OUTPUT=./out"
+    cmd: "{{.PYTHON}} cluster_screenshots.py \"{{.INPUT}}\" \"{{.OUTPUT}}\" {{.ARGS}}"
+
+  clean:
+    desc: Remove the virtual environment
+    cmd: rm -rf {{.VENV}}
+    prompt: This will delete {{.VENV}}. Continue?

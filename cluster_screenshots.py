@@ -63,6 +63,7 @@ import argparse
 import base64
 import csv
 import hashlib
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import html
 import json
 import math
@@ -292,34 +293,27 @@ def build_ocr_image_variants(image: Image.Image, mode: str = "fast") -> List[Tup
     image = image.convert("RGB")
     w, h = image.size
 
-    if mode == "fast":
-        scale = 1.5 if max(w, h) < 1800 else 1.0
-    elif mode == "balanced":
-        scale = 1.75 if max(w, h) < 2200 else 1.25
-    else:
-        scale = 2.0 if max(w, h) < 2500 else 1.5
+    scale = 2.0 if max(w, h) < 2500 else 1.5
+    upscaled = image.resize(
+        (int(w * scale), int(h * scale)),
+        Image.Resampling.LANCZOS,
+    )
 
-    if scale != 1.0:
-        image = image.resize(
-            (int(w * scale), int(h * scale)),
-            Image.Resampling.LANCZOS,
-        )
-
-    arr = np.array(image)
+    arr = np.array(upscaled)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
-    if mode == "fast":
-        # One robust variant only.
-        variants.append(("gray", gray))
-        return variants
+    variants.append(("gray", gray))
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     contrast = clahe.apply(gray)
+    variants.append(("clahe", contrast))
 
     denoised = cv2.bilateralFilter(contrast, 5, 75, 75)
+    variants.append(("denoised", denoised))
 
     blur = cv2.GaussianBlur(denoised, (0, 0), 1.0)
     sharpened = cv2.addWeighted(denoised, 1.6, blur, -0.6, 0)
+    variants.append(("sharpened", sharpened))
 
     _, otsu = cv2.threshold(
         sharpened,
@@ -327,14 +321,7 @@ def build_ocr_image_variants(image: Image.Image, mode: str = "fast") -> List[Tup
         255,
         cv2.THRESH_BINARY + cv2.THRESH_OTSU,
     )
-
-    if mode == "balanced":
-        variants.extend([
-            ("gray", gray),
-            ("sharpened", sharpened),
-            ("otsu", otsu),
-        ])
-        return variants
+    variants.append(("otsu", otsu))
 
     adaptive = cv2.adaptiveThreshold(
         sharpened,
@@ -344,16 +331,11 @@ def build_ocr_image_variants(image: Image.Image, mode: str = "fast") -> List[Tup
         31,
         9,
     )
+    variants.append(("adaptive", adaptive))
 
-    variants.extend([
-        ("gray", gray),
-        ("clahe", contrast),
-        ("sharpened", sharpened),
-        ("otsu", otsu),
-        ("adaptive", adaptive),
-        ("gray_inverted", cv2.bitwise_not(gray)),
-        ("otsu_inverted", cv2.bitwise_not(otsu)),
-    ])
+    variants.append(("gray_inverted", cv2.bitwise_not(gray)))
+    variants.append(("otsu_inverted", cv2.bitwise_not(otsu)))
+    variants.append(("adaptive_inverted", cv2.bitwise_not(adaptive)))
 
     return variants
 
@@ -393,9 +375,18 @@ def ocr_data_to_text_and_score(data: Dict[str, Any]) -> Tuple[str, float]:
 
 
 def extract_ocr_text_tesseract(image: Image.Image, lang: str, mode: str = "fast") -> str:
+    """
+    Run OCR using multiple preprocessing strategies and choose the best result.
+
+    This is slower than a single OCR pass, but much better for UI screenshots.
+    """
     candidates = []
     prepared_images = build_ocr_image_variants(image, mode=mode)
 
+    # 6  = assume a uniform block of text
+    # 11 = sparse text
+    # 12 = sparse text with OSD
+    # 3  = fully automatic page segmentation
     if mode == "fast":
         psm_modes = [6]
     elif mode == "balanced":
@@ -686,12 +677,7 @@ def extract_region_ocr_texts(
     for rect in filtered:
         try:
             cropped = crop_rect(image, rect, padding=12)
-            raw = extract_ocr_text_with_engine(
-                cropped,
-                lang=lang,
-                engine=engine,
-                mode=mode,
-            )
+            raw = extract_ocr_text_with_engine(cropped, lang=lang, engine=engine, mode=mode)
             norm = normalize_text(raw)
 
             if is_useful_ocr_text(norm):
@@ -702,12 +688,7 @@ def extract_region_ocr_texts(
 
     try:
         center = crop_center(image, margin_x=0.15, margin_y=0.15)
-        raw = extract_ocr_text_with_engine(
-            center,
-            lang=lang,
-            engine=engine,
-            mode=mode,
-        )
+        raw = extract_ocr_text_with_engine(center, lang=lang, engine=engine, mode=mode)
         norm = normalize_text(raw)
 
         if is_useful_ocr_text(norm):
@@ -988,21 +969,11 @@ def analyze_screenshot(
             index=index,
         )
 
-    ocr_text = extract_ocr_text_with_engine(
-        image,
-        lang=ocr_lang,
-        engine=ocr_engine,
-        mode=ocr_mode,
-    )
+    ocr_text = extract_ocr_text_with_engine(image, lang=ocr_lang, engine=ocr_engine, mode=ocr_mode)
     normalized = normalize_text(ocr_text)
 
     central_img = crop_center(image)
-    central_text_raw = extract_ocr_text_with_engine(
-        central_img,
-        lang=ocr_lang,
-        engine=ocr_engine,
-        mode=ocr_mode,
-    )
+    central_text_raw = extract_ocr_text_with_engine(central_img, lang=ocr_lang, engine=ocr_engine, mode=ocr_mode)
     central_text = normalize_text(central_text_raw)
 
     region_texts = extract_region_ocr_texts(
@@ -1865,6 +1836,27 @@ def generate_html_report(
     (out_dir / "report.html").write_text(doc, encoding="utf-8")
 
 
+
+def analyze_screenshot_worker(task: Tuple[str, int, str, str, str, Optional[str]]) -> ScreenshotItem:
+    """
+    Worker entrypoint for multiprocessing.
+
+    Keep it top-level so it is picklable on macOS/Windows.
+    """
+    path_str, index, ocr_lang, ocr_engine, ocr_mode, debug_ocr_dir_str = task
+
+    debug_ocr_dir = Path(debug_ocr_dir_str) if debug_ocr_dir_str else None
+
+    return analyze_screenshot(
+        path=Path(path_str),
+        index=index,
+        ocr_lang=ocr_lang,
+        ocr_engine=ocr_engine,
+        ocr_mode=ocr_mode,
+        debug_ocr_dir=debug_ocr_dir,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Cluster UI screenshots by visual, OCR text, layout, and rule-based semantic similarity."
@@ -1885,6 +1877,13 @@ def parse_args() -> argparse.Namespace:
         choices=["tesseract", "easyocr"],
         default="tesseract",
         help="OCR engine. Default: tesseract.",
+    )
+
+    parser.add_argument(
+        "--ocr-mode",
+        choices=["fast", "balanced", "accurate"],
+        default="fast",
+        help="OCR speed/quality mode. Default: fast.",
     )
 
     parser.add_argument(
@@ -1962,16 +1961,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--debug-ocr",
-        action="store_true",
-        help="Save OCR debug crops.",
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel screenshot analysis workers. Default: 1.",
     )
 
     parser.add_argument(
-        "--ocr-mode",
-        choices=["fast", "balanced", "accurate"],
-        default="fast",
-        help="OCR speed/quality mode. Default: fast.",
+        "--debug-ocr",
+        action="store_true",
+        help="Save OCR debug crops.",
     )
 
     return parser.parse_args()
@@ -2004,19 +2003,63 @@ def main() -> None:
     items: List[ScreenshotItem] = []
     debug_ocr_dir = out_dir / "debug-ocr" if args.debug_ocr else None
 
-    for index, path in enumerate(tqdm(image_paths, desc="Analyzing screenshots")):
-        try:
-            item = analyze_screenshot(
-                path=path,
-                index=index,
-                ocr_lang=args.ocr_lang,
-                ocr_engine=args.ocr_engine,
-                ocr_mode=args.ocr_mode,
-                debug_ocr_dir=debug_ocr_dir,
-            )
-            items.append(item)
-        except Exception as e:
-            print(f"Failed to analyze {path}: {e}")
+    workers = max(1, int(args.workers))
+
+    # Tesseract/OpenCV/NumPy may use internal threading.
+    # When using multiple Python worker processes, limiting nested native threads
+    # prevents CPU oversubscription and usually improves throughput.
+    if workers > 1:
+        os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    if args.ocr_engine == "easyocr" and workers > 1:
+        print("WARNING: EasyOCR loads a heavy torch model per worker. For EasyOCR, workers=1 is usually safer.")
+        print("         Use multiprocessing primarily with --ocr-engine tesseract.")
+
+    tasks = [
+        (
+            str(path),
+            index,
+            args.ocr_lang,
+            args.ocr_engine,
+            args.ocr_mode,
+            str(debug_ocr_dir) if debug_ocr_dir is not None else None,
+        )
+        for index, path in enumerate(image_paths)
+    ]
+
+    if workers == 1:
+        for task in tqdm(tasks, desc="Analyzing screenshots"):
+            path_str = task[0]
+            try:
+                item = analyze_screenshot_worker(task)
+                items.append(item)
+            except Exception as e:
+                print(f"Failed to analyze {path_str}: {e}")
+    else:
+        print(f"Using parallel screenshot analysis workers: {workers}")
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(analyze_screenshot_worker, task): task
+                for task in tasks
+            }
+
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Analyzing screenshots"):
+                task = futures[future]
+                path_str = task[0]
+
+                try:
+                    item = future.result()
+                    items.append(item)
+                except Exception as e:
+                    print(f"Failed to analyze {path_str}: {e}")
+
+        # Restore deterministic item order after parallel execution.
+        items.sort(key=lambda item: item.index)
 
     if not items:
         raise SystemExit("No screenshots were successfully analyzed.")

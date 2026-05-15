@@ -1857,6 +1857,24 @@ def analyze_screenshot_worker(task: Tuple[str, int, str, str, str, Optional[str]
     )
 
 
+def resolve_workers(value: str) -> int:
+    if value == "auto":
+        cpu_count = os.cpu_count() or 1
+
+        # Conservative default: half of logical cores.
+        return max(1, cpu_count // 2)
+
+    try:
+        workers = int(value)
+    except ValueError:
+        raise SystemExit(f"Invalid --workers value: {value}. Use integer or 'auto'.")
+
+    if workers < 1:
+        raise SystemExit("--workers must be >= 1")
+
+    return workers
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Cluster UI screenshots by visual, OCR text, layout, and rule-based semantic similarity."
@@ -1962,9 +1980,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--workers",
-        type=int,
-        default=1,
-        help="Number of parallel screenshot analysis workers. Default: 1.",
+        default="auto",
+        help="Number of parallel screenshot analysis workers. Use 'auto' for half of logical CPU cores. Default: auto.",
     )
 
     parser.add_argument(
@@ -2003,13 +2020,12 @@ def main() -> None:
     items: List[ScreenshotItem] = []
     debug_ocr_dir = out_dir / "debug-ocr" if args.debug_ocr else None
 
-    workers = max(1, int(args.workers))
+    workers = resolve_workers(args.workers)
+    print(f"Workers: {workers}")
 
-    # Tesseract/OpenCV/NumPy may use internal threading.
-    # When using multiple Python worker processes, limiting nested native threads
-    # prevents CPU oversubscription and usually improves throughput.
     if workers > 1:
         os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")

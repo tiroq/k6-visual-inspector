@@ -525,12 +525,14 @@ def crop_rect(image: Image.Image, rect: Rect, padding: int = 8) -> Image.Image:
 def iou_rect(a: Rect, b: Rect) -> float:
     ax1, ay1 = a.x, a.y
     ax2, ay2 = a.x + a.w, a.y + a.h
+
     bx1, by1 = b.x, b.y
     bx2, by2 = b.x + b.w, b.y + b.h
 
     ix1 = max(ax1, bx1)
     iy1 = max(ay1, by1)
     ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
 
     iw = max(0, ix2 - ix1)
     ih = max(0, iy2 - iy1)
@@ -2079,6 +2081,13 @@ def main() -> None:
 
     if not items:
         raise SystemExit("No screenshots were successfully analyzed.")
+
+    # Keep matrix indices compact after failed screenshot analysis.
+    # Some screenshots may fail OCR/layout analysis, so original input indices can have gaps.
+    items.sort(key=lambda item: item.index)
+
+    for new_index, item in enumerate(items):
+        item.index = new_index
 
     visual_matrix, text_matrix, layout_matrix, rule_matrix, combined_matrix = compute_similarity_matrices(
         items,

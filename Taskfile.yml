@@ -17,22 +17,33 @@ tasks:
       - test -d {{.VENV}}
 
   install:
-    desc: Install Python dependencies into the venv
+    desc: Install Python runtime and dev dependencies into the venv
     deps: [venv]
     cmds:
       - "{{.PIP}} install --upgrade pip"
       - "{{.PIP}} install -r requirements.txt"
+      - "{{.PIP}} install -r requirements-dev.txt"
 
   tesseract:
     desc: Install Tesseract OCR system dependency (Debian/Ubuntu only)
     cmd: sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
 
   setup:
-    desc: Full bootstrap — create venv and install dependencies
+    desc: Full bootstrap — create venv and install all dependencies
     deps: [install]
 
+  test:
+    desc: Run tests with pytest
+    deps: [install]
+    cmd: "{{.PYTHON}} -m pytest -q"
+
+  lint:
+    desc: Compile-check all Python source files
+    deps: [install]
+    cmd: "{{.PYTHON}} -m compileall k6_visual_inspector tests"
+
   run:
-    desc: "Run cluster_screenshots.py. Required vars: INPUT, OUTPUT. Optional: ARGS"
+    desc: "Run via python -m k6_visual_inspector. Required vars: INPUT, OUTPUT. Optional: ARGS"
     vars:
       INPUT: '{{.INPUT | default ""}}'
       OUTPUT: '{{.OUTPUT | default ""}}'
@@ -42,7 +53,7 @@ tasks:
         msg: "INPUT is required. Example: task run INPUT=./screenshots OUTPUT=./out"
       - sh: '[ -n "{{.OUTPUT}}" ]'
         msg: "OUTPUT is required. Example: task run INPUT=./screenshots OUTPUT=./out"
-    cmd: "{{.PYTHON}} cluster_screenshots.py \"{{.INPUT}}\" \"{{.OUTPUT}}\" {{.ARGS}}"
+    cmd: "{{.PYTHON}} -m k6_visual_inspector \"{{.INPUT}}\" \"{{.OUTPUT}}\" --ocr-mode fast --workers auto {{.ARGS}}"
 
   clean:
     desc: Remove the virtual environment

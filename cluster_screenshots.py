@@ -286,33 +286,40 @@ def deduplicate_texts(texts: List[str]) -> List[str]:
     return result
 
 
-def build_ocr_image_variants(image: Image.Image) -> List[Tuple[str, Any]]:
+def build_ocr_image_variants(image: Image.Image, mode: str = "fast") -> List[Tuple[str, Any]]:
     variants: List[Tuple[str, Any]] = []
 
     image = image.convert("RGB")
     w, h = image.size
 
-    scale = 2.0 if max(w, h) < 2500 else 1.5
-    upscaled = image.resize(
-        (int(w * scale), int(h * scale)),
-        Image.Resampling.LANCZOS,
-    )
+    if mode == "fast":
+        scale = 1.5 if max(w, h) < 1800 else 1.0
+    elif mode == "balanced":
+        scale = 1.75 if max(w, h) < 2200 else 1.25
+    else:
+        scale = 2.0 if max(w, h) < 2500 else 1.5
 
-    arr = np.array(upscaled)
+    if scale != 1.0:
+        image = image.resize(
+            (int(w * scale), int(h * scale)),
+            Image.Resampling.LANCZOS,
+        )
+
+    arr = np.array(image)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
-    variants.append(("gray", gray))
+    if mode == "fast":
+        # One robust variant only.
+        variants.append(("gray", gray))
+        return variants
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     contrast = clahe.apply(gray)
-    variants.append(("clahe", contrast))
 
     denoised = cv2.bilateralFilter(contrast, 5, 75, 75)
-    variants.append(("denoised", denoised))
 
     blur = cv2.GaussianBlur(denoised, (0, 0), 1.0)
     sharpened = cv2.addWeighted(denoised, 1.6, blur, -0.6, 0)
-    variants.append(("sharpened", sharpened))
 
     _, otsu = cv2.threshold(
         sharpened,
@@ -320,7 +327,14 @@ def build_ocr_image_variants(image: Image.Image) -> List[Tuple[str, Any]]:
         255,
         cv2.THRESH_BINARY + cv2.THRESH_OTSU,
     )
-    variants.append(("otsu", otsu))
+
+    if mode == "balanced":
+        variants.extend([
+            ("gray", gray),
+            ("sharpened", sharpened),
+            ("otsu", otsu),
+        ])
+        return variants
 
     adaptive = cv2.adaptiveThreshold(
         sharpened,
@@ -330,11 +344,16 @@ def build_ocr_image_variants(image: Image.Image) -> List[Tuple[str, Any]]:
         31,
         9,
     )
-    variants.append(("adaptive", adaptive))
 
-    variants.append(("gray_inverted", cv2.bitwise_not(gray)))
-    variants.append(("otsu_inverted", cv2.bitwise_not(otsu)))
-    variants.append(("adaptive_inverted", cv2.bitwise_not(adaptive)))
+    variants.extend([
+        ("gray", gray),
+        ("clahe", contrast),
+        ("sharpened", sharpened),
+        ("otsu", otsu),
+        ("adaptive", adaptive),
+        ("gray_inverted", cv2.bitwise_not(gray)),
+        ("otsu_inverted", cv2.bitwise_not(otsu)),
+    ])
 
     return variants
 
@@ -373,20 +392,16 @@ def ocr_data_to_text_and_score(data: Dict[str, Any]) -> Tuple[str, float]:
     return joined, score
 
 
-def extract_ocr_text_tesseract(image: Image.Image, lang: str) -> str:
-    """
-    Run OCR using multiple preprocessing strategies and choose the best result.
-
-    This is slower than a single OCR pass, but much better for UI screenshots.
-    """
+def extract_ocr_text_tesseract(image: Image.Image, lang: str, mode: str = "fast") -> str:
     candidates = []
-    prepared_images = build_ocr_image_variants(image)
+    prepared_images = build_ocr_image_variants(image, mode=mode)
 
-    # 6  = assume a uniform block of text
-    # 11 = sparse text
-    # 12 = sparse text with OSD
-    # 3  = fully automatic page segmentation
-    psm_modes = [6, 11, 12, 3]
+    if mode == "fast":
+        psm_modes = [6]
+    elif mode == "balanced":
+        psm_modes = [6, 11]
+    else:
+        psm_modes = [6, 11, 12, 3]
 
     for variant_name, variant in prepared_images:
         for psm in psm_modes:
@@ -482,9 +497,10 @@ def extract_ocr_text_with_engine(
     image: Image.Image,
     lang: str,
     engine: str,
+    mode: str = "fast",
 ) -> str:
     if engine == "tesseract":
-        return extract_ocr_text_tesseract(image, lang=lang)
+        return extract_ocr_text_tesseract(image, lang=lang, mode=mode)
 
     if engine == "easyocr":
         languages = parse_easyocr_languages(lang)
@@ -624,6 +640,7 @@ def extract_region_ocr_texts(
     rects: List[Rect],
     lang: str,
     engine: str,
+    mode: str,
 ) -> List[str]:
     """
     Run OCR on the most informative UI regions.
@@ -659,12 +676,22 @@ def extract_region_ocr_texts(
         if not any(iou_rect(rect, existing) > 0.70 for existing in filtered):
             filtered.append(rect)
 
-    filtered = filtered[:8]
+    if mode == "fast":
+        filtered = filtered[:2]
+    elif mode == "balanced":
+        filtered = filtered[:4]
+    else:
+        filtered = filtered[:8]
 
     for rect in filtered:
         try:
             cropped = crop_rect(image, rect, padding=12)
-            raw = extract_ocr_text_with_engine(cropped, lang=lang, engine=engine)
+            raw = extract_ocr_text_with_engine(
+                cropped,
+                lang=lang,
+                engine=engine,
+                mode=mode,
+            )
             norm = normalize_text(raw)
 
             if is_useful_ocr_text(norm):
@@ -675,7 +702,12 @@ def extract_region_ocr_texts(
 
     try:
         center = crop_center(image, margin_x=0.15, margin_y=0.15)
-        raw = extract_ocr_text_with_engine(center, lang=lang, engine=engine)
+        raw = extract_ocr_text_with_engine(
+            center,
+            lang=lang,
+            engine=engine,
+            mode=mode,
+        )
         norm = normalize_text(raw)
 
         if is_useful_ocr_text(norm):
@@ -936,6 +968,7 @@ def analyze_screenshot(
     index: int,
     ocr_lang: str,
     ocr_engine: str,
+    ocr_mode: str,
     debug_ocr_dir: Optional[Path] = None,
 ) -> ScreenshotItem:
     image = load_image(path)
@@ -955,11 +988,21 @@ def analyze_screenshot(
             index=index,
         )
 
-    ocr_text = extract_ocr_text_with_engine(image, lang=ocr_lang, engine=ocr_engine)
+    ocr_text = extract_ocr_text_with_engine(
+        image,
+        lang=ocr_lang,
+        engine=ocr_engine,
+        mode=ocr_mode,
+    )
     normalized = normalize_text(ocr_text)
 
     central_img = crop_center(image)
-    central_text_raw = extract_ocr_text_with_engine(central_img, lang=ocr_lang, engine=ocr_engine)
+    central_text_raw = extract_ocr_text_with_engine(
+        central_img,
+        lang=ocr_lang,
+        engine=ocr_engine,
+        mode=ocr_mode,
+    )
     central_text = normalize_text(central_text_raw)
 
     region_texts = extract_region_ocr_texts(
@@ -967,6 +1010,7 @@ def analyze_screenshot(
         rects=rects,
         lang=ocr_lang,
         engine=ocr_engine,
+        mode=ocr_mode,
     )
 
     all_text_for_tokens = " ".join([normalized, central_text, *region_texts])
@@ -1923,6 +1967,13 @@ def parse_args() -> argparse.Namespace:
         help="Save OCR debug crops.",
     )
 
+    parser.add_argument(
+        "--ocr-mode",
+        choices=["fast", "balanced", "accurate"],
+        default="fast",
+        help="OCR speed/quality mode. Default: fast.",
+    )
+
     return parser.parse_args()
 
 
@@ -1960,6 +2011,7 @@ def main() -> None:
                 index=index,
                 ocr_lang=args.ocr_lang,
                 ocr_engine=args.ocr_engine,
+                ocr_mode=args.ocr_mode,
                 debug_ocr_dir=debug_ocr_dir,
             )
             items.append(item)

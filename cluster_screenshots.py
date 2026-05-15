@@ -27,6 +27,7 @@ import hashlib
 import html
 import json
 import math
+import csv
 import os
 import re
 import shutil
@@ -78,12 +79,18 @@ class ScreenshotItem:
 
     ocr_text: str
     normalized_text: str
+    central_ocr_text: str
+    region_ocr_texts: List[str]
     text_tokens: List[str]
 
     rects: List[Rect]
     layout_signature: List[float]
+    semantic_signature: str
 
-    cluster_id: Optional[int] = None
+    rule_labels: Dict[str, Any]
+
+    template_cluster_id: Optional[int] = None
+    final_cluster_id: Optional[int] = None
     nearest_to_representative_score: Optional[float] = None
 
 
@@ -94,13 +101,122 @@ class Cluster:
     representative_index: int
     representative_path: str
 
+    cluster_name: str
+    visual_class: str
+    text_class: str
+    severity: str
+
     avg_visual_similarity: float
     avg_text_similarity: float
     avg_layout_similarity: float
+    avg_rule_similarity: float
     avg_combined_similarity: float
 
     items: List[int] = field(default_factory=list)
     common_tokens: List[str] = field(default_factory=list)
+    text_variants: List[str] = field(default_factory=list)
+
+
+def write_cluster_summary_csv(clusters: List[Cluster], out_dir: Path) -> None:
+    path = out_dir / "cluster-summary.csv"
+
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "cluster_id",
+                "cluster_name",
+                "count",
+                "severity",
+                "visual_class",
+                "text_class",
+                "avg_combined_similarity",
+                "avg_visual_similarity",
+                "avg_text_similarity",
+                "avg_layout_similarity",
+                "avg_rule_similarity",
+                "representative_path",
+            ],
+        )
+
+        writer.writeheader()
+
+        for c in clusters:
+            writer.writerow(
+                {
+                    "cluster_id": c.cluster_id,
+                    "cluster_name": c.cluster_name,
+                    "count": c.count,
+                    "severity": c.severity,
+                    "visual_class": c.visual_class,
+                    "text_class": c.text_class,
+                    "avg_combined_similarity": round(c.avg_combined_similarity, 4),
+                    "avg_visual_similarity": round(c.avg_visual_similarity, 4),
+                    "avg_text_similarity": round(c.avg_text_similarity, 4),
+                    "avg_layout_similarity": round(c.avg_layout_similarity, 4),
+                    "avg_rule_similarity": round(c.avg_rule_similarity, 4),
+                    "representative_path": c.representative_path,
+                }
+            )
+
+
+def build_cluster_name(items: List[ScreenshotItem], indices: List[int]) -> Tuple[str, str, str, str]:
+    visual_counts: Dict[str, int] = {}
+    text_counts: Dict[str, int] = {}
+    severity_counts: Dict[str, int] = {}
+
+    for idx in indices:
+        labels = items[idx].rule_labels
+
+        visual = labels.get("visual_class", "unknown")
+        text = labels.get("text_class", "unknown")
+        severity = labels.get("severity", "medium")
+
+        visual_counts[visual] = visual_counts.get(visual, 0) + 1
+        text_counts[text] = text_counts.get(text, 0) + 1
+        severity_counts[severity] = severity_counts.get(severity, 0) + 1
+
+    visual_class = max(visual_counts.items(), key=lambda kv: kv[1])[0]
+    text_class = max(text_counts.items(), key=lambda kv: kv[1])[0]
+    severity = max(severity_counts.items(), key=lambda kv: kv[1])[0]
+
+    name = safe_name(f"{visual_class}.{text_class}")
+
+    return name, visual_class, text_class, severity
+
+
+def text_variants_for_cluster(
+    items: List[ScreenshotItem],
+    indices: List[int],
+    limit: int = 8,
+) -> List[str]:
+    seen = set()
+    variants: List[str] = []
+
+    for idx in indices:
+        text = " ".join([
+            items[idx].normalized_text,
+            items[idx].central_ocr_text,
+            *items[idx].region_ocr_texts,
+        ]).strip()
+
+        text = re.sub(r"\s+", " ", text)
+
+        if not text:
+            continue
+
+        short = text[:500]
+
+        if short in seen:
+            continue
+
+        seen.add(short)
+        variants.append(short)
+
+        if len(variants) >= limit:
+            break
+
+    return variants
 
 
 def sha256_file(path: Path) -> str:
@@ -130,29 +246,39 @@ def pil_to_cv(image: Image.Image) -> np.ndarray:
 def normalize_text(text: str) -> str:
     text = text.lower()
 
-    # Normalize URLs, emails, ids, dates, times, numbers.
-    text = re.sub(r"https?://\S+", " <url> ", text)
-    text = re.sub(r"\b[\w.+-]+@[\w.-]+\.\w+\b", " <email> ", text)
+    replacements = [
+        (r"https?://\S+", " <url> "),
+        (r"\b[\w.+-]+@[\w.-]+\.\w+\b", " <email> "),
 
-    # UUIDs.
-    text = re.sub(
-        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
-        " <uuid> ",
-        text,
-    )
+        # UUID.
+        (
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+            " <uuid> ",
+        ),
 
-    # Long hex / hashes / ids.
-    text = re.sub(r"\b[0-9a-f]{10,}\b", " <hex> ", text)
+        # Long hashes / ids.
+        (r"\b[0-9a-f]{10,}\b", " <hex> "),
 
-    # ISO-like dates and times.
-    text = re.sub(r"\b\d{4}-\d{2}-\d{2}[t\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?z?\b", " <datetime> ", text)
-    text = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", " <date> ", text)
-    text = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", " <time> ", text)
+        # Dates / datetimes / times.
+        (r"\b\d{4}-\d{2}-\d{2}[t\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?z?\b", " <datetime> "),
+        (r"\b\d{4}-\d{2}-\d{2}\b", " <date> "),
+        (r"\b\d{1,2}[/:]\d{2}(?::\d{2})?\b", " <time> "),
 
-    # Numbers, prices, counts.
-    text = re.sub(r"\b\d+(?:[.,]\d+)?\b", " <num> ", text)
+        # Common trading / technical IDs.
+        (r"\b(order|trade|request|session|correlation|trace|span)[-_ ]?id[:= ]+[a-z0-9._:-]+\b", r" \1_id <id> "),
+        (r"\b[a-z]{2,10}-\d{3,}\b", " <business_id> "),
 
-    # Normalize whitespace and punctuation noise.
+        # Numbers.
+        (r"\b\d+(?:[.,]\d+)?\b", " <num> "),
+    ]
+
+    for pattern, repl in replacements:
+        text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+
+    # Keep useful status codes as semantic tokens before generic cleanup.
+    text = re.sub(r"\b5xx\b", " backend_error ", text)
+    text = re.sub(r"\b4xx\b", " client_error ", text)
+
     text = re.sub(r"[^\w<>/.-]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
 
@@ -184,25 +310,238 @@ def tokenize_text(text: str) -> List[str]:
     return [t for t in tokens if t not in stop]
 
 
+def crop_center(image: Image.Image, margin_x: float = 0.18, margin_y: float = 0.18) -> Image.Image:
+    width, height = image.size
+
+    left = int(width * margin_x)
+    top = int(height * margin_y)
+    right = int(width * (1.0 - margin_x))
+    bottom = int(height * (1.0 - margin_y))
+
+    return image.crop((left, top, right, bottom))
+
+
+def crop_rect(image: Image.Image, rect: Rect, padding: int = 8) -> Image.Image:
+    width, height = image.size
+
+    left = max(0, rect.x - padding)
+    top = max(0, rect.y - padding)
+    right = min(width, rect.x + rect.w + padding)
+    bottom = min(height, rect.y + rect.h + padding)
+
+    return image.crop((left, top, right, bottom))
+
+
+def extract_region_ocr_texts(image: Image.Image, rects: List[Rect], lang: str) -> List[str]:
+    texts: List[str] = []
+
+    # Prioritize semantic regions.
+    priority_kinds = {
+        "modal_or_dialog",
+        "content_frame",
+        "browser_error",
+        "region",
+    }
+
+    selected = [
+        r for r in rects
+        if r.kind in priority_kinds and r.area_ratio >= 0.03
+    ][:5]
+
+    for rect in selected:
+        try:
+            cropped = crop_rect(image, rect)
+            text = extract_ocr_text(cropped, lang=lang)
+            norm = normalize_text(text)
+            if norm:
+                texts.append(norm)
+        except Exception:
+            continue
+
+    return texts
+
+
 def extract_ocr_text(image: Image.Image, lang: str) -> str:
-    # Upscale a little to improve OCR for browser screenshots.
     w, h = image.size
     scale = 1.5 if max(w, h) < 1800 else 1.0
+
     if scale != 1.0:
         image = image.resize((int(w * scale), int(h * scale)))
 
     gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
 
-    # Mild thresholding improves text extraction for many UI screenshots.
+    # Improve contrast.
     gray = cv2.bilateralFilter(gray, 5, 75, 75)
+
+    # Try both threshold and grayscale OCR. Use the longer result.
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     config = "--psm 6"
+
     try:
-        return pytesseract.image_to_string(thresh, lang=lang, config=config)
+        text_a = pytesseract.image_to_string(thresh, lang=lang, config=config)
     except pytesseract.TesseractError:
-        # Fallback to English if requested language pack is not installed.
-        return pytesseract.image_to_string(thresh, lang="eng", config=config)
+        text_a = pytesseract.image_to_string(thresh, lang="eng", config=config)
+
+    try:
+        text_b = pytesseract.image_to_string(gray, lang=lang, config=config)
+    except pytesseract.TesseractError:
+        text_b = pytesseract.image_to_string(gray, lang="eng", config=config)
+
+    return text_a if len(text_a.strip()) >= len(text_b.strip()) else text_b
+
+
+def detect_rule_labels(
+    normalized_text: str,
+    central_text: str,
+    region_texts: List[str],
+    rects: List[Rect],
+    width: int,
+    height: int,
+) -> Dict[str, Any]:
+    joined = " ".join([normalized_text, central_text, *region_texts]).lower()
+
+    rect_kinds = [r.kind for r in rects]
+
+    has_modal = "modal_or_dialog" in rect_kinds
+    has_content_frame = "content_frame" in rect_kinds
+    has_topbar = "topbar_or_header" in rect_kinds
+    has_sidebar = "sidebar_or_panel" in rect_kinds
+
+    visual_class = "unknown"
+    text_class = "unknown"
+    severity = "medium"
+
+    # Visual class.
+    if has_modal:
+        visual_class = "error_modal" if looks_like_error_text(joined) else "modal"
+    elif looks_like_browser_error(joined):
+        visual_class = "browser_error"
+    elif looks_like_loading(joined):
+        visual_class = "loading"
+    elif looks_like_empty_state(joined):
+        visual_class = "empty_state"
+    elif has_content_frame or has_topbar or has_sidebar:
+        visual_class = "normal_or_content_page"
+    else:
+        visual_class = "unknown"
+
+    # Text class.
+    if re.search(r"\b(500|internal server error|server error|backend error|backend_error)\b", joined):
+        text_class = "backend_500"
+        severity = "high"
+    elif re.search(r"\b(502|bad gateway)\b", joined):
+        text_class = "bad_gateway_502"
+        severity = "high"
+    elif re.search(r"\b(503|service unavailable|temporarily unavailable)\b", joined):
+        text_class = "service_unavailable_503"
+        severity = "high"
+    elif re.search(r"\b(504|gateway timeout|timeout|timed out|deadline exceeded)\b", joined):
+        text_class = "timeout"
+        severity = "high"
+    elif re.search(r"\b(401|unauthorized|not authorized|login required)\b", joined):
+        text_class = "unauthorized"
+        severity = "high"
+    elif re.search(r"\b(403|forbidden|access denied|permission denied)\b", joined):
+        text_class = "forbidden"
+        severity = "high"
+    elif re.search(r"\b(404|not found)\b", joined):
+        text_class = "not_found"
+        severity = "medium"
+    elif re.search(r"\b(429|too many requests|rate limit|rate_limited)\b", joined):
+        text_class = "rate_limit"
+        severity = "high"
+    elif re.search(r"\b(validation|invalid|required|missing|incorrect)\b", joined):
+        text_class = "validation_error"
+        severity = "medium"
+    elif looks_like_loading(joined):
+        text_class = "loading_or_spinner"
+        severity = "medium"
+    elif looks_like_empty_state(joined):
+        text_class = "empty_state"
+        severity = "low"
+    elif not joined.strip():
+        text_class = "no_text"
+        severity = "medium"
+
+    if visual_class == "error_modal" and text_class == "unknown":
+        text_class = "generic_error"
+        severity = "high"
+
+    cluster_hint = f"{visual_class}.{text_class}"
+
+    return {
+        "visual_class": visual_class,
+        "text_class": text_class,
+        "severity": severity,
+        "cluster_hint": cluster_hint,
+        "has_modal": has_modal,
+        "has_content_frame": has_content_frame,
+        "has_topbar": has_topbar,
+        "has_sidebar": has_sidebar,
+        "rect_kinds": rect_kinds,
+    }
+
+
+def looks_like_error_text(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(error|failed|failure|exception|unable|cannot|could not|invalid|denied|unauthorized|forbidden|timeout|unavailable)\b",
+            text,
+        )
+    )
+
+
+def looks_like_browser_error(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(this site can.t be reached|connection refused|bad gateway|service unavailable|gateway timeout|http error|page crashed|aw snap)\b",
+            text,
+        )
+    )
+
+
+def looks_like_loading(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(loading|please wait|processing|spinner|in progress|загрузка|подождите)\b",
+            text,
+        )
+    )
+
+
+def looks_like_empty_state(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(no data|nothing found|empty|no records|no results|нет данных|ничего не найдено)\b",
+            text,
+        )
+    )
+
+
+def build_semantic_signature(item_like: Dict[str, Any]) -> str:
+    rects = item_like["rects"]
+    rule_labels = item_like["rule_labels"]
+
+    rect_kinds = []
+    for r in rects[:10]:
+        if isinstance(r, Rect):
+            rect_kinds.append(r.kind)
+        else:
+            rect_kinds.append(r["kind"])
+
+    parts = [
+        "UI screenshot from k6/browser load test.",
+        f"Visual class: {rule_labels.get('visual_class', 'unknown')}.",
+        f"Text class: {rule_labels.get('text_class', 'unknown')}.",
+        f"Severity: {rule_labels.get('severity', 'unknown')}.",
+        f"Layout regions: {', '.join(rect_kinds)}.",
+        f"Normalized OCR: {item_like.get('normalized_text', '')}",
+        f"Central OCR: {item_like.get('central_ocr_text', '')}",
+        f"Region OCR: {' | '.join(item_like.get('region_ocr_texts', []))}",
+    ]
+
+    return "\n".join(parts)
 
 
 def detect_layout_rects(image: Image.Image) -> List[Rect]:
@@ -438,11 +777,14 @@ def combined_similarity(
     visual: float,
     text: float,
     layout: float,
+    rule: float,
     visual_weight: float,
     text_weight: float,
     layout_weight: float,
+    rule_weight: float,
 ) -> float:
-    total = visual_weight + text_weight + layout_weight
+    total = visual_weight + text_weight + layout_weight + rule_weight
+
     if total <= 0:
         raise ValueError("At least one weight must be positive")
 
@@ -450,6 +792,7 @@ def combined_similarity(
         visual * visual_weight
         + text * text_weight
         + layout * layout_weight
+        + rule * rule_weight
     ) / total
 
 
@@ -460,11 +803,39 @@ def analyze_screenshot(path: Path, index: int, ocr_lang: str) -> ScreenshotItem:
     p_hash = imagehash.phash(image)
     d_hash = imagehash.dhash(image)
 
-    ocr_text = extract_ocr_text(image, ocr_lang)
-    normalized = normalize_text(ocr_text)
-    tokens = tokenize_text(normalized)
-
     rects = detect_layout_rects(image)
+
+    ocr_text = extract_ocr_text(image, lang=ocr_lang)
+    normalized = normalize_text(ocr_text)
+
+    central_img = crop_center(image)
+    central_text_raw = extract_ocr_text(central_img, lang=ocr_lang)
+    central_text = normalize_text(central_text_raw)
+
+    region_texts = extract_region_ocr_texts(image, rects, lang=ocr_lang)
+
+    all_text_for_tokens = " ".join([normalized, central_text, *region_texts])
+    tokens = tokenize_text(all_text_for_tokens)
+
+    rule_labels = detect_rule_labels(
+        normalized_text=normalized,
+        central_text=central_text,
+        region_texts=region_texts,
+        rects=rects,
+        width=width,
+        height=height,
+    )
+
+    item_like = {
+        "normalized_text": normalized,
+        "central_ocr_text": central_text,
+        "region_ocr_texts": region_texts,
+        "rects": rects,
+        "rule_labels": rule_labels,
+    }
+
+    semantic_signature = build_semantic_signature(item_like)
+
     layout_signature = build_layout_signature(image, rects)
 
     return ScreenshotItem(
@@ -478,10 +849,39 @@ def analyze_screenshot(path: Path, index: int, ocr_lang: str) -> ScreenshotItem:
         dhash=str(d_hash),
         ocr_text=ocr_text,
         normalized_text=normalized,
+        central_ocr_text=central_text,
+        region_ocr_texts=region_texts,
         text_tokens=tokens,
         rects=rects,
         layout_signature=layout_signature,
+        semantic_signature=semantic_signature,
+        rule_labels=rule_labels,
     )
+
+
+def rule_similarity(a: ScreenshotItem, b: ScreenshotItem) -> float:
+    la = a.rule_labels
+    lb = b.rule_labels
+
+    score = 0.0
+    weight = 0.0
+
+    checks = [
+        ("visual_class", 0.35),
+        ("text_class", 0.40),
+        ("severity", 0.10),
+        ("cluster_hint", 0.15),
+    ]
+
+    for key, w in checks:
+        weight += w
+        if la.get(key) == lb.get(key):
+            score += w
+
+    if weight <= 0:
+        return 0.0
+
+    return score / weight
 
 
 def find_images(input_dir: Path) -> List[Path]:
@@ -498,40 +898,161 @@ def compute_similarity_matrices(
     visual_weight: float,
     text_weight: float,
     layout_weight: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    rule_weight: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n = len(items)
 
     visual = np.eye(n, dtype=np.float32)
     text = np.eye(n, dtype=np.float32)
     layout = np.eye(n, dtype=np.float32)
+    rule = np.eye(n, dtype=np.float32)
     combined = np.eye(n, dtype=np.float32)
 
     for i in tqdm(range(n), desc="Comparing screenshots"):
         for j in range(i + 1, n):
-            # Combine pHash and dHash for more stable visual similarity.
             ph = hamming_hash_similarity(items[i].phash, items[j].phash)
             dh = hamming_hash_similarity(items[i].dhash, items[j].dhash)
             v = (ph * 0.7) + (dh * 0.3)
 
-            t = text_similarity(items[i].normalized_text, items[j].normalized_text)
+            text_a = " ".join([
+                items[i].normalized_text,
+                items[i].central_ocr_text,
+                *items[i].region_ocr_texts,
+            ])
 
+            text_b = " ".join([
+                items[j].normalized_text,
+                items[j].central_ocr_text,
+                *items[j].region_ocr_texts,
+            ])
+
+            t = text_similarity(text_a, text_b)
             l = cosine_similarity(items[i].layout_signature, items[j].layout_signature)
+            r = rule_similarity(items[i], items[j])
 
             c = combined_similarity(
                 visual=v,
                 text=t,
                 layout=l,
+                rule=r,
                 visual_weight=visual_weight,
                 text_weight=text_weight,
                 layout_weight=layout_weight,
+                rule_weight=rule_weight,
             )
 
             visual[i, j] = visual[j, i] = v
             text[i, j] = text[j, i] = t
             layout[i, j] = layout[j, i] = l
+            rule[i, j] = rule[j, i] = r
             combined[i, j] = combined[j, i] = c
 
-    return visual, text, layout, combined
+    return visual, text, layout, rule, combined
+
+
+def cluster_by_matrix(
+    similarity_matrix: np.ndarray,
+    threshold: float,
+) -> List[int]:
+    n = similarity_matrix.shape[0]
+
+    if n == 0:
+        return []
+
+    if n == 1:
+        return [0]
+
+    distance_matrix = 1.0 - similarity_matrix
+    distance_threshold = 1.0 - threshold
+
+    try:
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            metric="precomputed",
+            linkage="average",
+            distance_threshold=distance_threshold,
+        )
+    except TypeError:
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            affinity="precomputed",
+            linkage="average",
+            distance_threshold=distance_threshold,
+        )
+
+    return [int(x) for x in model.fit_predict(distance_matrix)]
+
+
+def two_stage_cluster_items(
+    items: List[ScreenshotItem],
+    visual_matrix: np.ndarray,
+    layout_matrix: np.ndarray,
+    text_matrix: np.ndarray,
+    rule_matrix: np.ndarray,
+    template_threshold: float,
+    final_threshold: float,
+) -> List[int]:
+    n = len(items)
+
+    # Template similarity mostly ignores text.
+    template_matrix = (
+        visual_matrix * 0.45
+        + layout_matrix * 0.45
+        + rule_matrix * 0.10
+    )
+
+    template_labels = cluster_by_matrix(template_matrix, threshold=template_threshold)
+
+    for item, label in zip(items, template_labels):
+        item.template_cluster_id = label
+
+    template_to_indices: Dict[int, List[int]] = {}
+    for idx, label in enumerate(template_labels):
+        template_to_indices.setdefault(label, []).append(idx)
+
+    final_labels = [-1] * n
+    next_cluster_id = 0
+
+    for _, indices in sorted(template_to_indices.items(), key=lambda kv: min(kv[1])):
+        if len(indices) == 1:
+            final_labels[indices[0]] = next_cluster_id
+            next_cluster_id += 1
+            continue
+
+        # Final similarity inside a visual template gives more power to text/rules.
+        sub_matrix = np.eye(len(indices), dtype=np.float32)
+
+        for local_i, global_i in enumerate(indices):
+            for local_j, global_j in enumerate(indices):
+                if local_i >= local_j:
+                    continue
+
+                score = (
+                    visual_matrix[global_i, global_j] * 0.20
+                    + layout_matrix[global_i, global_j] * 0.20
+                    + text_matrix[global_i, global_j] * 0.35
+                    + rule_matrix[global_i, global_j] * 0.25
+                )
+
+                sub_matrix[local_i, local_j] = score
+                sub_matrix[local_j, local_i] = score
+
+        sub_labels = cluster_by_matrix(sub_matrix, threshold=final_threshold)
+
+        local_to_global_cluster: Dict[int, int] = {}
+
+        for local_idx, sub_label in enumerate(sub_labels):
+            if sub_label not in local_to_global_cluster:
+                local_to_global_cluster[sub_label] = next_cluster_id
+                next_cluster_id += 1
+
+            global_idx = indices[local_idx]
+            final_labels[global_idx] = local_to_global_cluster[sub_label]
+
+    for item, label in zip(items, final_labels):
+        item.final_cluster_id = label
+
+    return final_labels
 
 
 def cluster_items(
@@ -624,12 +1145,13 @@ def build_clusters(
     visual_matrix: np.ndarray,
     text_matrix: np.ndarray,
     layout_matrix: np.ndarray,
+    rule_matrix: np.ndarray,
     combined_matrix: np.ndarray,
 ) -> List[Cluster]:
     label_to_indices: Dict[int, List[int]] = {}
 
     for item, label in zip(items, labels):
-        item.cluster_id = label
+        item.final_cluster_id = label
         label_to_indices.setdefault(label, []).append(item.index)
 
     clusters: List[Cluster] = []
@@ -640,37 +1162,50 @@ def build_clusters(
         key=lambda xs: (-len(xs), min(xs)),
     )
 
-    old_to_new: Dict[int, int] = {}
+    remap: Dict[int, int] = {}
 
     for new_cluster_id, indices in enumerate(sorted_groups):
-        old_label = items[indices[0]].cluster_id
+        old_label = items[indices[0]].final_cluster_id
         assert old_label is not None
-        old_to_new[old_label] = new_cluster_id
+        remap[old_label] = new_cluster_id
 
     for item in items:
-        assert item.cluster_id is not None
-        item.cluster_id = old_to_new[item.cluster_id]
+        assert item.final_cluster_id is not None
+        item.final_cluster_id = remap[item.final_cluster_id]
 
     new_groups: Dict[int, List[int]] = {}
+
     for item in items:
-        assert item.cluster_id is not None
-        new_groups.setdefault(item.cluster_id, []).append(item.index)
+        assert item.final_cluster_id is not None
+        new_groups.setdefault(item.final_cluster_id, []).append(item.index)
 
     for cluster_id, indices in sorted(new_groups.items()):
         representative = choose_representative(indices, combined_matrix)
 
         if len(indices) > 1:
-            pairs = [(i, j) for pos, i in enumerate(indices) for j in indices[pos + 1 :]]
+            pairs = [
+                (i, j)
+                for pos, i in enumerate(indices)
+                for j in indices[pos + 1:]
+            ]
 
             avg_visual = float(np.mean([visual_matrix[i, j] for i, j in pairs]))
             avg_text = float(np.mean([text_matrix[i, j] for i, j in pairs]))
             avg_layout = float(np.mean([layout_matrix[i, j] for i, j in pairs]))
+            avg_rule = float(np.mean([rule_matrix[i, j] for i, j in pairs]))
             avg_combined = float(np.mean([combined_matrix[i, j] for i, j in pairs]))
         else:
-            avg_visual = avg_text = avg_layout = avg_combined = 1.0
+            avg_visual = avg_text = avg_layout = avg_rule = avg_combined = 1.0
 
         for idx in indices:
-            items[idx].nearest_to_representative_score = float(combined_matrix[idx, representative])
+            items[idx].nearest_to_representative_score = float(
+                combined_matrix[idx, representative]
+            )
+
+        cluster_name, visual_class, text_class, severity = build_cluster_name(
+            items,
+            indices,
+        )
 
         clusters.append(
             Cluster(
@@ -678,12 +1213,18 @@ def build_clusters(
                 count=len(indices),
                 representative_index=representative,
                 representative_path=items[representative].path,
+                cluster_name=cluster_name,
+                visual_class=visual_class,
+                text_class=text_class,
+                severity=severity,
                 avg_visual_similarity=avg_visual,
                 avg_text_similarity=avg_text,
                 avg_layout_similarity=avg_layout,
+                avg_rule_similarity=avg_rule,
                 avg_combined_similarity=avg_combined,
                 items=sorted(indices),
                 common_tokens=common_tokens_for_cluster(items, indices),
+                text_variants=text_variants_for_cluster(items, indices),
             )
         )
 
@@ -1018,6 +1559,33 @@ def parse_args() -> argparse.Namespace:
         help="Limit number of screenshots for debugging. 0 means no limit.",
     )
 
+    parser.add_argument(
+        "--rule-weight",
+        type=float,
+        default=0.20,
+        help="Weight of rule-based semantic similarity. Default: 0.20.",
+    )
+
+    parser.add_argument(
+        "--template-threshold",
+        type=float,
+        default=0.84,
+        help="Similarity threshold for first-stage visual/layout template clustering. Default: 0.84.",
+    )
+
+    parser.add_argument(
+        "--final-threshold",
+        type=float,
+        default=0.78,
+        help="Similarity threshold for second-stage text/symptom clustering inside templates. Default: 0.78.",
+    )
+
+    parser.add_argument(
+        "--single-stage",
+        action="store_true",
+        help="Use old single-stage clustering instead of two-stage clustering.",
+    )
+
     return parser.parse_args()
 
 
@@ -1055,18 +1623,30 @@ def main() -> None:
     if not items:
         raise SystemExit("No screenshots were successfully analyzed.")
 
-    visual_matrix, text_matrix, layout_matrix, combined_matrix = compute_similarity_matrices(
+    visual_matrix, text_matrix, layout_matrix, rule_matrix, combined_matrix = compute_similarity_matrices(
         items,
         visual_weight=args.visual_weight,
         text_weight=args.text_weight,
         layout_weight=args.layout_weight,
+        rule_weight=args.rule_weight,
     )
 
-    labels = cluster_items(
-        items,
-        combined_similarity_matrix=combined_matrix,
-        threshold=args.threshold,
-    )
+    if args.single_stage:
+        labels = cluster_items(
+            items,
+            combined_similarity_matrix=combined_matrix,
+            threshold=args.threshold,
+        )
+    else:
+        labels = two_stage_cluster_items(
+            items=items,
+            visual_matrix=visual_matrix,
+            layout_matrix=layout_matrix,
+            text_matrix=text_matrix,
+            rule_matrix=rule_matrix,
+            template_threshold=args.template_threshold,
+            final_threshold=args.final_threshold,
+        )
 
     clusters = build_clusters(
         items=items,
@@ -1074,6 +1654,7 @@ def main() -> None:
         visual_matrix=visual_matrix,
         text_matrix=text_matrix,
         layout_matrix=layout_matrix,
+        rule_matrix=rule_matrix,
         combined_matrix=combined_matrix,
     )
 
@@ -1093,6 +1674,9 @@ def main() -> None:
     np.save(out_dir / "similarity_combined.npy", combined_matrix)
 
     write_overlay_images(items, clusters, out_dir)
+
+    write_cluster_summary_csv(clusters, out_dir)
+    np.save(out_dir / "similarity_rule.npy", rule_matrix)
 
     create_cluster_directories(
         items=items,
@@ -1118,6 +1702,7 @@ def main() -> None:
     print(f"HTML report: {out_dir / 'report.html'}")
     print(f"Clusters JSON: {out_dir / 'clusters.json'}")
     print(f"Items JSONL: {out_dir / 'items.jsonl'}")
+    print(f"Cluster CSV: {out_dir / 'cluster-summary.csv'}")
 
 
 if __name__ == "__main__":

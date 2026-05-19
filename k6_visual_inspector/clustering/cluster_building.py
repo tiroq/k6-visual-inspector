@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from ..models import Cluster, ScreenshotItem
-from ..io.filesystem import safe_name
+from ..fileio.filesystem import safe_name
 
 
 def choose_representative(

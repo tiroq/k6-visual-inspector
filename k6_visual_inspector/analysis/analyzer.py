@@ -11,10 +11,11 @@ from PIL import Image
 from ..models import Rect, ScreenshotItem
 from ..image.loading import load_image
 from ..image.hashing import compute_hashes
-from ..image.layout import detect_layout_rects, build_layout_signature
+from ..image.layout import detect_layout_rects, build_layout_signature, iou_rect
 from ..image.crops import crop_center, crop_rect
 from ..ocr.engines import extract_ocr_text
 from ..ocr.cleanup import normalize_text, tokenize_text, is_useful_ocr_text, deduplicate_texts
+from ..fileio.filesystem import safe_name
 from .rules import detect_rule_labels
 from .signatures import build_semantic_signature
 
@@ -51,8 +52,6 @@ def _extract_region_ocr_texts(
     - top banner / toast-like area;
     - center crop.
     """
-    from ..image.layout import iou_rect
-
     texts: List[str] = []
     _, height = image.size
     selected: List[Rect] = []
@@ -123,8 +122,6 @@ def save_ocr_debug_crops(
     index: int,
 ) -> None:
     """Save the full image, center crop, and per-rect crops for OCR debugging."""
-    from ..io.filesystem import safe_name
-
     base = safe_name(original_path.stem)
     item_dir = out_dir / f"{index:05d}__{base}"
     item_dir.mkdir(parents=True, exist_ok=True)

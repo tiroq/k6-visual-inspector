@@ -37,6 +37,7 @@ class TestNormalizeText:
     def test_hex_ids_are_normalized(self):
         result = normalize_text("Hash: a1b2c3d4e5f6a7b8")
         assert "<hex>" in result
+        assert "a1b2c3d4" not in result
 
     def test_lowercased(self):
         result = normalize_text("HELLO WORLD")

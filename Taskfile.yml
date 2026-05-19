@@ -53,7 +53,7 @@ tasks:
         msg: "INPUT is required. Example: task run INPUT=./screenshots OUTPUT=./out"
       - sh: '[ -n "{{.OUTPUT}}" ]'
         msg: "OUTPUT is required. Example: task run INPUT=./screenshots OUTPUT=./out"
-    cmd: "{{.PYTHON}} -m k6_visual_inspector \"{{.INPUT}}\" \"{{.OUTPUT}}\" --ocr-mode fast --workers auto {{.ARGS}}"
+    cmd: "{{.PYTHON}} -m k6_visual_inspector \"{{.INPUT}}\" \"{{.OUTPUT}}\" {{.ARGS}}"
 
   clean:
     desc: Remove the virtual environment

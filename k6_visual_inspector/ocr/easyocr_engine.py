@@ -12,7 +12,9 @@ from typing import List
 import numpy as np
 from PIL import Image
 
-_EASYOCR_READER = None
+# Readers are keyed by the sorted language tuple so that different language
+# combinations each get their own initialised reader.
+_EASYOCR_READERS: dict = {}
 
 
 def parse_easyocr_languages(ocr_lang: str) -> List[str]:
@@ -35,17 +37,16 @@ def parse_easyocr_languages(ocr_lang: str) -> List[str]:
 
 
 def extract_ocr_text_easyocr(image: Image.Image, languages: List[str]) -> str:
-    """Run OCR using EasyOCR. Initializes the reader on first use."""
-    global _EASYOCR_READER
-
+    """Run OCR using EasyOCR. Initializes and caches a reader per language set."""
     import easyocr  # noqa: PLC0415 — optional dependency, imported lazily
 
-    if _EASYOCR_READER is None:
-        _EASYOCR_READER = easyocr.Reader(languages, gpu=False)
+    lang_key = tuple(sorted(languages))
+    if lang_key not in _EASYOCR_READERS:
+        _EASYOCR_READERS[lang_key] = easyocr.Reader(list(lang_key), gpu=False)
 
     arr = np.array(image.convert("RGB"))
 
-    results = _EASYOCR_READER.readtext(
+    results = _EASYOCR_READERS[lang_key].readtext(
         arr,
         detail=1,
         paragraph=True,

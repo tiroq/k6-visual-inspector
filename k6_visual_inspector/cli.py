@@ -13,8 +13,8 @@ from tqdm import tqdm
 
 from .config import AppConfig, resolve_workers
 from .models import ScreenshotItem
-from .io.discovery import find_images
-from .io.serialization import (
+from .fileio.discovery import find_images
+from .fileio.serialization import (
     item_to_json_dict,
     write_jsonl,
     write_clusters_json,

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List
 
 from ..models import Cluster, ScreenshotItem
-from ..io.filesystem import copy_or_symlink
+from ..fileio.filesystem import copy_or_symlink
 
 
 def create_cluster_directories(
